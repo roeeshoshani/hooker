@@ -2,6 +2,12 @@
 name = "hooker"
 version = "0.1.0"
 edition = "2021"
+authors = ["Roee Shoshani"]
+description = "a helper for hooking functions in x64"
+repository = "https://github.com/roeeshoshani/hooker"
+license = "MIT"
+keywords = ["hook", "x86"]
+categories = ["embedded", "no-std"]
 
 [dependencies]
 arrayvec = { version = "0.7.4", default-features = false }
