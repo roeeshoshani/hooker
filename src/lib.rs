@@ -7,7 +7,7 @@ use thiserror_no_std::Error;
 use zydis_sys::{
     ZyanStatus, ZydisDecodedInstruction, ZydisDecodedOperand, ZydisDecoder, ZydisDecoderContext,
     ZydisDecoderDecodeInstruction, ZydisDecoderDecodeOperands, ZydisDecoderInit, ZydisMachineMode,
-    ZydisOperandType, ZydisRegister, ZydisStackWidth, ZYDIS_MAX_INSTRUCTION_LENGTH,
+    ZydisMnemonic, ZydisOperandType, ZydisRegister, ZydisStackWidth, ZYDIS_MAX_INSTRUCTION_LENGTH,
     ZYDIS_MAX_OPERAND_COUNT_VISIBLE,
 };
 
@@ -50,7 +50,7 @@ pub fn gen_hook_info(
     hooked_function_content: &[u8],
     hooked_function_runtime_addr: u64,
     hook_function_runtime_addr: u64,
-) -> Result<HookInfo, RelocateError> {
+) -> Result<HookInfo, HookError> {
     let jumper = determine_best_jumper_kind_and_build(
         hooked_function_runtime_addr,
         hook_function_runtime_addr,
@@ -128,15 +128,26 @@ pub fn determine_best_jumper_kind_and_build(
 pub fn relocate_fn_start(
     hooked_function_content: &[u8],
     relocate_bytes_amount: usize,
-) -> Result<RelocateFnStartInfo, RelocateError> {
+) -> Result<RelocateFnStartInfo, HookError> {
     let mut cur_index = 0;
     let decoder = Decoder::new();
     while cur_index < relocate_bytes_amount {
         let insn = decoder
             .decode(&hooked_function_content[cur_index..])
-            .map_err(|_| RelocateError::FailedToDecodeInsn { offset: cur_index })?;
+            .map_err(|_| HookError::FailedToDecodeInsn { offset: cur_index })?;
         if is_insn_rip_relative(&insn) {
-            return Err(RelocateError::RipRelativeInsn { offset: cur_index });
+            return Err(HookError::RipRelativeInsn { offset: cur_index });
+        }
+        let insn_end_index = cur_index + insn.insn.length as usize;
+        // if we encounter a `ret`, this is the end of this function, so make sure that this is the last instruction that
+        // we need to relocate.
+        if insn.insn.mnemonic == ZydisMnemonic::ZYDIS_MNEMONIC_RET
+            && insn_end_index < relocate_bytes_amount
+        {
+            return Err(HookError::FunctionTooSmallTooHook {
+                function_size: insn_end_index,
+                jumper_size: relocate_bytes_amount,
+            });
         }
         cur_index += insn.insn.length as usize;
     }
@@ -237,12 +248,18 @@ struct DecodedInsnInfo {
 
 /// an error which occured while trying to relocate instructions.
 #[derive(Debug, Error)]
-pub enum RelocateError {
+pub enum HookError {
     #[error("failed to decode instruction at offset {offset}")]
     FailedToDecodeInsn { offset: usize },
 
     #[error("can't relocate rip relative instruction at offset {offset}")]
     RipRelativeInsn { offset: usize },
+
+    #[error("function size {function_size} is to small for jumper of size {jumper_size}")]
+    FunctionTooSmallTooHook {
+        function_size: usize,
+        jumper_size: usize,
+    },
 }
 
 /// the different kinds of jumper available
