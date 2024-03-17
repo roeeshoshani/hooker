@@ -84,7 +84,7 @@ impl<'a> HookInfo<'a> {
     /// builds a trampoline which will be placed at the given runtime address.
     /// the size of the trampoline can be determined by calling [`trampoline_size`].
     ///
-    /// [`trampoline_size`]: HookFunctionInfo::trampoline_size
+    /// [`trampoline_size`]: HookInfo::trampoline_size
     pub fn build_trampoline(&self, trampoline_runtime_addr: u64) -> TrampolineBytes {
         let mut tramp_bytes = TrampolineBytes::new();
         tramp_bytes
