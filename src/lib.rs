@@ -7,24 +7,30 @@ use thiserror_no_std::Error;
 use zydis_sys::{
     ZyanStatus, ZydisDecodedInstruction, ZydisDecodedOperand, ZydisDecoder, ZydisDecoderContext,
     ZydisDecoderDecodeInstruction, ZydisDecoderDecodeOperands, ZydisDecoderInit, ZydisMachineMode,
-    ZydisOperandType, ZydisRegister, ZydisStackWidth, ZYDIS_MAX_INSTRUCTION_LENGTH,
-    ZYDIS_MAX_OPERAND_COUNT_VISIBLE,
+    ZydisOperandType, ZydisRegister, ZydisStackWidth, ZYDIS_MAX_OPERAND_COUNT_VISIBLE,
 };
 
-pub const MAX_INSN_BYTES: usize = ZYDIS_MAX_INSTRUCTION_LENGTH as usize;
 const MAX_INSN_VISIBLE_OPERANDS: usize = ZYDIS_MAX_OPERAND_COUNT_VISIBLE as usize;
 const ZYAN_IS_ERROR_BIT_MASK: u32 = 0x80000000;
 const JMP_RIP_INSN_LEN: usize = 6;
 const JMP_RIP_INSN: [u8; JMP_RIP_INSN_LEN] = [0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
 
+/// the length of a short relative jumper.
 pub const SHORT_REL_JUMPER_LEN: usize = core::mem::size_of::<ShortRelJumper>();
+
+/// the length of a short jumper.
 pub const SHORT_JUMPER_LEN: usize = core::mem::size_of::<ShortJumper>();
+
+/// the length of a long jumper.
 pub const LONG_JUMPER_LEN: usize = core::mem::size_of::<LongJumper>();
 
+/// the maximum length of a jumper of any kind.
 pub const MAX_JUMPER_LEN: usize = LONG_JUMPER_LEN;
 
+/// a type alias for the bytes of a jumper.
 pub type JumperBytes = ArrayVec<u8, MAX_JUMPER_LEN>;
 
+/// determines the best jumper kind to use in a specific case.
 pub fn determine_best_jumper_kind(
     hooked_function_addr: usize,
     hook_function_addr: usize,
@@ -40,8 +46,8 @@ pub fn determine_best_jumper_kind(
     }
 }
 
-/// relocate the instructions at the start of the function so that we can put them in a different memory address and they will still work
-/// fine.
+/// relocate the instructions at the start of the function so that we can put them in a different memory address and they
+/// will still work fine.
 pub fn relocate_fn_start(
     hooked_function_content: &[u8],
     relocate_bytes_amount: usize,
@@ -62,7 +68,10 @@ pub fn relocate_fn_start(
     })
 }
 
+/// information needed to relocate the bytes at the start of a function.
 pub struct RelocateFnStartInfo {
+    /// the amount of bytes that you need to copy to properly relocate the instructions at the start of this function.
+    /// this may be larger than the amount of bytes requested to be relocated since that amount may not end on an instruction boundary.
     pub bytes_to_copy: usize,
 }
 
@@ -149,6 +158,7 @@ struct DecodedInsnInfo {
     operands: ArrayVec<ZydisDecodedOperand, MAX_INSN_VISIBLE_OPERANDS>,
 }
 
+/// an error which occured while trying to relocate instructions.
 #[derive(Debug, Error)]
 pub enum RelocateError {
     #[error("failed to decode instruction at offset {offset}")]
@@ -158,6 +168,7 @@ pub enum RelocateError {
     RipRelativeInsn { offset: usize },
 }
 
+/// the different kinds of jumper available
 pub enum JumperKind {
     /// a short relative jumper, which is a 32 bit relative jump.
     ShortRel,
@@ -167,6 +178,7 @@ pub enum JumperKind {
     Long,
 }
 impl JumperKind {
+    /// returns the size of the jumper in bytes
     pub fn size_in_bytes(&self) -> usize {
         match self {
             JumperKind::ShortRel => SHORT_REL_JUMPER_LEN,
@@ -174,6 +186,7 @@ impl JumperKind {
             JumperKind::Long => LONG_JUMPER_LEN,
         }
     }
+    /// builds the jumper into an array of bytes.
     pub fn build_jumper(&self, hooked_function_addr: u64, hook_function_addr: u64) -> JumperBytes {
         match self {
             JumperKind::ShortRel => {
