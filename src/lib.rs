@@ -7,7 +7,8 @@ use thiserror_no_std::Error;
 use zydis_sys::{
     ZyanStatus, ZydisDecodedInstruction, ZydisDecodedOperand, ZydisDecoder, ZydisDecoderContext,
     ZydisDecoderDecodeInstruction, ZydisDecoderDecodeOperands, ZydisDecoderInit, ZydisMachineMode,
-    ZydisOperandType, ZydisRegister, ZydisStackWidth, ZYDIS_MAX_OPERAND_COUNT_VISIBLE,
+    ZydisOperandType, ZydisRegister, ZydisStackWidth, ZYDIS_MAX_INSTRUCTION_LENGTH,
+    ZYDIS_MAX_OPERAND_COUNT_VISIBLE,
 };
 
 const MAX_INSN_VISIBLE_OPERANDS: usize = ZYDIS_MAX_OPERAND_COUNT_VISIBLE as usize;
@@ -27,23 +28,99 @@ pub const LONG_JUMPER_LEN: usize = core::mem::size_of::<LongJumper>();
 /// the maximum length of a jumper of any kind.
 pub const MAX_JUMPER_LEN: usize = LONG_JUMPER_LEN;
 
+/// the maximum length of a trampoiline.
+pub const MAX_TRAMPOLINE_LEN: usize = {
+    // the calculation here is as follows:
+    // first, we need to take into account the maximum length of the relocated instructions. the maximum amount of bytes that need
+    // relocation is the max jumper len, since this is the max amount of bytes that will be overwritten at the start of the function.
+    // but then, we have to take into account the fact that the jumper that we put at the start of the function might not end on an
+    // instruction boundary, which may increase its length in the worst case by the max length of an instruction minus one byte.
+    // then, we add the jumper that we put at the end of the trampoline to get the final resul.t
+    MAX_JUMPER_LEN + ZYDIS_MAX_INSTRUCTION_LENGTH as usize - 1 + MAX_JUMPER_LEN
+};
+
 /// a type alias for the bytes of a jumper.
 pub type JumperBytes = ArrayVec<u8, MAX_JUMPER_LEN>;
 
+/// a type alias for the bytes of a trampoline.
+pub type TrampolineBytes = ArrayVec<u8, MAX_TRAMPOLINE_LEN>;
+
+/// generates information needed to hook the given function.
+pub fn gen_hook_info(
+    hooked_function_content: &[u8],
+    hooked_function_runtime_addr: u64,
+    hook_function_runtime_addr: u64,
+) -> Result<HookInfo, RelocateError> {
+    let jumper = determine_best_jumper_kind_and_build(
+        hooked_function_runtime_addr,
+        hook_function_runtime_addr,
+    );
+    let relocated_fn_info = relocate_fn_start(hooked_function_content, jumper.len())?;
+    Ok(HookInfo {
+        jumper,
+        relocation_copied_bytes_amount: relocated_fn_info.bytes_to_copy,
+        hooked_function_content,
+        hooked_function_runtime_addr,
+    })
+}
+
+/// information required for hooking a function
+pub struct HookInfo<'a> {
+    jumper: JumperBytes,
+    relocation_copied_bytes_amount: usize,
+    hooked_function_runtime_addr: u64,
+    hooked_function_content: &'a [u8],
+}
+impl<'a> HookInfo<'a> {
+    /// returns the jumper which should be placed at the start of the hooked function in order to hook it.
+    /// this takes ownership of the hook info. make sure that you first build your trampoline.
+    pub fn jumper(self) -> JumperBytes {
+        self.jumper
+    }
+    /// returns the size of the trampoline which will be built for this hooked function.
+    pub fn trampoline_size(&self) -> usize {
+        self.relocation_copied_bytes_amount + LONG_JUMPER_LEN
+    }
+    /// builds a trampoline which will be placed at the given runtime address.
+    /// the size of the trampoline can be determined by calling [`trampoline_size`].
+    ///
+    /// [`trampoline_size`]: HookFunctionInfo::trampoline_size
+    pub fn build_trampoline(&self, trampoline_runtime_addr: u64) -> TrampolineBytes {
+        let mut tramp_bytes = TrampolineBytes::new();
+        tramp_bytes
+            .try_extend_from_slice(
+                &self.hooked_function_content[..self.relocation_copied_bytes_amount],
+            )
+            .unwrap();
+        let jumper = JumperKind::Long.build(
+            trampoline_runtime_addr + self.relocation_copied_bytes_amount as u64,
+            self.hooked_function_runtime_addr + self.relocation_copied_bytes_amount as u64,
+        );
+        tramp_bytes.try_extend_from_slice(&jumper).unwrap();
+        tramp_bytes
+    }
+}
+
 /// determines the best jumper kind to use in a specific case.
-pub fn determine_best_jumper_kind(
-    hooked_function_addr: usize,
-    hook_function_addr: usize,
-) -> JumperKind {
+pub fn determine_best_jumper_kind(jumper_addr: u64, target_addr: u64) -> JumperKind {
     let short_rel_hook_offset =
-        (hooked_function_addr + SHORT_REL_JUMPER_LEN).wrapping_sub(hook_function_addr) as isize;
+        (jumper_addr + SHORT_REL_JUMPER_LEN as u64).wrapping_sub(target_addr) as i64;
     if i32::try_from(short_rel_hook_offset).is_ok() {
         JumperKind::ShortRel
-    } else if u32::try_from(hook_function_addr).is_ok() {
+    } else if u32::try_from(target_addr).is_ok() {
         JumperKind::Short
     } else {
         JumperKind::Long
     }
+}
+
+/// determines the best jumper kind to use in a specific case and builds it.
+pub fn determine_best_jumper_kind_and_build(
+    hooked_function_runtime_addr: u64,
+    hook_function_runtime_addr: u64,
+) -> JumperBytes {
+    determine_best_jumper_kind(hooked_function_runtime_addr, hook_function_runtime_addr)
+        .build(hooked_function_runtime_addr, hook_function_runtime_addr)
 }
 
 /// relocate the instructions at the start of the function so that we can put them in a different memory address and they
@@ -187,11 +264,11 @@ impl JumperKind {
         }
     }
     /// builds the jumper into an array of bytes.
-    pub fn build_jumper(&self, hooked_function_addr: u64, hook_function_addr: u64) -> JumperBytes {
+    pub fn build(&self, jumper_addr: u64, target_addr: u64) -> JumperBytes {
         match self {
             JumperKind::ShortRel => {
-                let jmp_insn_end_addr = hooked_function_addr + SHORT_REL_JUMPER_LEN as u64;
-                let displacement = hook_function_addr.wrapping_sub(jmp_insn_end_addr) as i64;
+                let jmp_insn_end_addr = jumper_addr + SHORT_REL_JUMPER_LEN as u64;
+                let displacement = target_addr.wrapping_sub(jmp_insn_end_addr) as i64;
                 let displacement_i32 = i32::try_from(displacement)
                     .expect("tried to use a short relative jumper for but the distance from the hooked function to the hook does not fit in 32 bits");
                 let jumper_union = ShortRelJumperUnion {
@@ -203,7 +280,7 @@ impl JumperKind {
                 unsafe { jumper_union.bytes }.as_slice().try_into().unwrap()
             }
             JumperKind::Short => {
-                let hook_function_addr_u32 = u32::try_from(hook_function_addr)
+                let hook_function_addr_u32 = u32::try_from(target_addr)
                     .expect("tried to use a short jumper but the hook function address does not fit in 32 bits");
                 let jumper_union = ShortJumperUnion {
                     jumper: ShortJumper {
@@ -220,7 +297,7 @@ impl JumperKind {
                 let jumper_union = LongJumperUnion {
                     jumper: LongJumper {
                         jmp_rip: JMP_RIP_INSN,
-                        target_addr: hook_function_addr,
+                        target_addr,
                     },
                 };
                 unsafe { jumper_union.bytes }.as_slice().try_into().unwrap()
@@ -276,7 +353,7 @@ struct LongJumper {
 #[repr(packed)]
 union LongJumperUnion {
     jumper: LongJumper,
-    bytes: [u8; SHORT_JUMPER_LEN],
+    bytes: [u8; LONG_JUMPER_LEN],
 }
 
 fn zyan_is_err(status: ZyanStatus) -> bool {
