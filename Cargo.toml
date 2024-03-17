@@ -1,0 +1,12 @@
+[package]
+name = "hooker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrayvec = { version = "0.7.4", default-features = false }
+thiserror-no-std = "2.0.2"
+zydis-sys = "0.1.1"
+
+[features]
+std = [ "thiserror-no-std/std" ]
