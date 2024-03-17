@@ -15,7 +15,7 @@ thiserror-no-std = "2.0.2"
 zydis-sys = "0.1.1"
 
 [features]
-std = [ "thiserror-no-std/std" ]
+std = [ "thiserror-no-std/std", "arrayvec/std" ]
 
 [dev-dependencies]
 region = "3.0.1"
