@@ -1,102 +1,84 @@
-use hooker::{
-    determine_best_jumper_kind, determine_best_jumper_kind_and_build, gen_hook_info,
-    relocate_fn_start,
-};
-use memmap::{MmapMut, MmapOptions};
-use proc_maps::{get_process_maps, MapRange, Pid};
-use rand::random;
+use hooker::gen_hook_info;
+use region::{Allocation, Protection, Region};
 
 /// find the memory mapping of the `.text` section, where our code is
-fn find_text_section_mapping() -> MapRange {
-    let hooked_function_addr = hooked_function as usize;
-    let existing_mappings = get_process_maps(std::process::id() as Pid)
-        .expect("failed to get current process memory maps");
-    existing_mappings
-        .into_iter()
-        .find(|mapping| {
-            let mapping_range = mapping.start()..mapping.start() + mapping.size();
-            mapping_range.contains(&hooked_function_addr)
-        })
-        .expect("failed to find text section mapping")
+fn mem_region_of_hooked_fn() -> Region {
+    region::query(hooked_fn as *const u8)
+        .expect("failed to find memory region containing hooked fn")
 }
 
-/// creates a new anonymous memory mapping and copies the contents of the given mapping into it.
-fn remap_and_copy_mapping(mapping: &MapRange) -> MmapMut {
-    let mut created_mapping = alloc_anon_mapping(mapping.size());
-    created_mapping.copy_from_slice(unsafe {
-        core::slice::from_raw_parts(mapping.start() as *const u8, mapping.size())
-    });
-    created_mapping
+/// make the memory region containing the hooked fn writable.
+fn make_rwx(region: &Region) {
+    unsafe {
+        region::protect(
+            region.as_ptr::<u8>(),
+            region.len(),
+            Protection::READ_WRITE_EXECUTE,
+        )
+        .expect("failed to make region rwx")
+    };
 }
 
 /// allocate an anonymous memory mapping of the given size.
-fn alloc_anon_mapping(size: usize) -> MmapMut {
-    MmapOptions::new()
-        .len(size)
-        .map_anon()
-        .expect("failed to create anonymous memory mapping")
+fn alloc_rwx(size: usize) -> Allocation {
+    region::alloc(size, Protection::READ_WRITE_EXECUTE).expect("failed to allocate rwx memory")
 }
 
 fn main() {
-    let text_section_mapping = find_text_section_mapping();
-    let mut created_mapping = remap_and_copy_mapping(&text_section_mapping);
+    // make the hooked fn writable
+    let hooked_fn_region = mem_region_of_hooked_fn();
+    make_rwx(&hooked_fn_region);
 
-    // calculate the address of the hooked function in the new mapping
-    let hooked_function_offset_in_mapping = hooked_function as usize - text_section_mapping.start();
-    let hooked_function_remapped_addr =
-        hooked_function_offset_in_mapping + created_mapping.as_ptr() as usize;
+    // generate a slice of the possible content of the hooked fn, that is the content from the start of the hooked fn to the
+    // end of the region which contains it.
+    let hooked_fn_region_end_addr =
+        hooked_fn_region.as_ptr::<u8>() as usize + hooked_fn_region.len();
+    let hooked_fn_possible_content = unsafe {
+        core::slice::from_raw_parts(
+            hooked_fn as *const u8,
+            hooked_fn_region_end_addr - hooked_fn as usize,
+        )
+    };
 
-    // build the jumper
-    let hook_info = gen_hook_info(
-        &created_mapping[hooked_function_offset_in_mapping..],
-        hooked_function_remapped_addr as u64,
-        hook_function as u64,
-    )
-    .expect("");
+    // generate the hook info
+    let hook_info = gen_hook_info(hooked_fn_possible_content, hooked_fn as u64, hook_fn as u64)
+        .expect("failed to generate hook info");
 
     // allocate and build trampoline
-    let mut trampoline_mapping = alloc_anon_mapping(hook_info.trampoline_size());
-    let trampoline = hook_info.build_trampoline(trampoline_mapping.as_mut_ptr() as u64);
-    trampoline_mapping[..trampoline.len()].copy_from_slice(&trampoline);
+    let mut trampoline_alloc = alloc_rwx(hook_info.trampoline_size());
+    let trampoline = hook_info.build_trampoline(trampoline_alloc.as_mut_ptr::<u8>() as u64);
+    unsafe {
+        trampoline_alloc
+            .as_mut_ptr::<u8>()
+            .copy_from_nonoverlapping(trampoline.as_ptr(), trampoline.len())
+    };
 
-    // write the jumper to the start of the hooked function
+    // write the jumper to the start of the hooked fn
     let jumper = hook_info.jumper();
-    created_mapping[hooked_function_offset_in_mapping..][..jumper.len()].copy_from_slice(&jumper);
+    let hooked_fn_content_ptr = hooked_fn as *mut u8;
 
-    // make the remapped text section executable
-    let _executable_created_mapping = created_mapping
-        .make_exec()
-        .expect("failed to make mapping executable");
-    let hooked_function_remapped: extern "C" fn(u32) -> u32 =
-        unsafe { core::mem::transmute(hooked_function_remapped_addr) };
+    // call the hooked fn
+    unsafe { hooked_fn_content_ptr.copy_from_nonoverlapping(jumper.as_ptr(), jumper.len()) };
+    println!("calling hooked fn");
+    let result = hooked_fn(1337);
+    println!("hooked fn returned {}", result);
 
-    // call the hooked function
-    println!("calling hooked function");
-    let result = hooked_function_remapped(1337);
-    println!("hooked function returned {}", result);
-
-    // make the trampoline executable
-    let executable_trampoline_mapping = trampoline_mapping
-        .make_exec()
-        .expect("failed to make mapping executable");
+    // call the trampoline to call the original fn
     let trampoline_fn: extern "C" fn(u32) -> u32 =
-        unsafe { core::mem::transmute(executable_trampoline_mapping.as_ptr()) };
-
-    // call the trampoline to call the original function
+        unsafe { core::mem::transmute(trampoline_alloc.as_ptr::<u8>()) };
     println!("calling trampoline");
     let tramp_result = trampoline_fn(5);
     println!("trampoline returned {}", tramp_result);
 }
 
-extern "C" fn hooked_function(input: u32) -> u32 {
-    let mut result = 1u32;
-    for i in 2..input {
-        result *= i;
-    }
-    result
+#[inline(never)]
+extern "C" fn hooked_fn(input: u32) -> u32 {
+    println!("hooked fn was called, input: {}", input);
+    44
 }
 
-extern "C" fn hook_function(input: u32) -> u32 {
+#[inline(never)]
+extern "C" fn hook_fn(input: u32) -> u32 {
     println!("hook was called, input: {}", input);
     33
 }

@@ -18,7 +18,4 @@ zydis-sys = "0.1.1"
 std = [ "thiserror-no-std/std" ]
 
 [dev-dependencies]
-memmap = "0.7.0"
-proc-maps = "0.3.2"
-rand = "0.8.5"
 region = "3.0.1"
