@@ -126,11 +126,10 @@ pub fn gen_hook_info(
     hook_fn_runtime_addr: u64,
 ) -> Result<HookInfo, HookError> {
     let jumper = determine_best_jumper_kind_and_build(hooked_fn_runtime_addr, hook_fn_runtime_addr);
-    let relocated_fn_info =
-        relocate_fn_start(hooked_fn_content, hooked_fn_runtime_addr, jumper.len())?;
+    let relocated_fn = relocate_fn_start(hooked_fn_content, hooked_fn_runtime_addr, jumper.len())?;
     Ok(HookInfo {
         jumper,
-        relocated_insns_bytes: relocated_fn_info.relocated_insns_bytes,
+        relocated_fn,
         hooked_fn_runtime_addr,
     })
 }
@@ -138,7 +137,7 @@ pub fn gen_hook_info(
 /// information required for hooking a fn
 pub struct HookInfo {
     jumper: JumperBytes,
-    relocated_insns_bytes: RelocatedInsnsBytes,
+    relocated_fn: RelocatedFnStart,
     hooked_fn_runtime_addr: u64,
 }
 impl HookInfo {
@@ -149,7 +148,7 @@ impl HookInfo {
     }
     /// returns the size of the trampoline which will be built for this hooked fn.
     pub fn trampoline_size(&self) -> usize {
-        self.relocated_insns_bytes.len() + LONG_JUMPER_LEN
+        self.relocated_fn.relocated_insns_bytes.len() + LONG_JUMPER_LEN
     }
     /// builds a trampoline which will be placed at the given runtime address.
     /// the size of the trampoline can be determined by calling [`trampoline_size`].
@@ -158,11 +157,11 @@ impl HookInfo {
     pub fn build_trampoline(&self, trampoline_runtime_addr: u64) -> TrampolineBytes {
         let mut tramp_bytes = TrampolineBytes::new();
         tramp_bytes
-            .try_extend_from_slice(&self.relocated_insns_bytes)
+            .try_extend_from_slice(&self.relocated_fn.relocated_insns_bytes)
             .unwrap();
         let jumper = JumperKind::Long.build(
-            trampoline_runtime_addr + self.relocated_insns_bytes.len() as u64,
-            self.hooked_fn_runtime_addr + self.relocated_insns_bytes.len() as u64,
+            trampoline_runtime_addr + self.relocated_fn.relocated_insns_bytes.len() as u64,
+            self.hooked_fn_runtime_addr + self.relocated_fn.trampoline_jumper_target_offset as u64,
         );
         tramp_bytes.try_extend_from_slice(&jumper).unwrap();
         tramp_bytes
@@ -242,6 +241,7 @@ pub fn relocate_fn_start(
     }
     Ok(RelocatedFnStart {
         relocated_insns_bytes,
+        trampoline_jumper_target_offset: cur_index,
     })
 }
 
@@ -444,6 +444,8 @@ enum BranchKind {
 pub struct RelocatedFnStart {
     /// the bytes of the relocated instructions.
     pub relocated_insns_bytes: RelocatedInsnsBytes,
+    /// the offset in the hooked function where the trampoline jumper should jump to in order to continue execution of this function.
+    pub trampoline_jumper_target_offset: usize,
 }
 
 struct Decoder {
