@@ -1,6 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-use core::mem::MaybeUninit;
+use core::{mem::MaybeUninit, ops::Range};
 
 use arrayvec::ArrayVec;
 use thiserror_no_std::Error;
@@ -168,6 +168,8 @@ pub fn relocate_fn_start(
     let mut cur_index = 0;
     let decoder = Decoder::new();
     let mut relocated_insns_bytes = RelocatedInsnsBytes::new();
+    let relocated_insns_addr_range =
+        hooked_fn_runtime_addr..hooked_fn_runtime_addr + relocate_bytes_amount as u64;
     while cur_index < relocate_bytes_amount {
         let insn = decoder
             .decode(
@@ -175,7 +177,7 @@ pub fn relocate_fn_start(
                 hooked_fn_runtime_addr + cur_index as u64,
             )
             .map_err(|_| HookError::FailedToDecodeInsn { offset: cur_index })?;
-        match relocate_insn(&insn, cur_index)? {
+        match relocate_insn(&insn, cur_index, &relocated_insns_addr_range)? {
             Some(relocated_insn) => relocated_insns_bytes
                 .try_extend_from_slice(relocated_insn.as_slice())
                 .unwrap(),
@@ -209,9 +211,15 @@ pub fn relocate_fn_start(
 fn relocate_insn(
     decoded_insn: &DecodedInsnInfo,
     decoded_insn_offset: usize,
+    relocated_insns_addr_range: &Range<u64>,
 ) -> Result<Option<RelocatedInsnBytes>, HookError> {
     if let Some(branch_kind) = mnemonic_is_branch(decoded_insn.insn.mnemonic) {
-        return relocate_branch_insn(decoded_insn, decoded_insn_offset, branch_kind);
+        return relocate_branch_insn(
+            decoded_insn,
+            decoded_insn_offset,
+            branch_kind,
+            relocated_insns_addr_range,
+        );
     }
 
     if is_insn_rip_relative(decoded_insn) {
@@ -227,6 +235,7 @@ fn relocate_branch_insn(
     decoded_insn: &DecodedInsnInfo,
     decoded_insn_offset: usize,
     branch_kind: BranchKind,
+    relocated_insns_addr_range: &Range<u64>,
 ) -> Result<Option<RelocatedInsnBytes>, HookError> {
     assert_eq!(decoded_insn.operands.len(), 1);
     let operand = &decoded_insn.operands[0];
@@ -241,6 +250,13 @@ fn relocate_branch_insn(
             }
             let insn_end_addr = decoded_insn.end_addr();
             let branch_target = insn_end_addr.wrapping_add(unsafe { imm_operand.value.u });
+            if relocated_insns_addr_range.contains(&branch_target) {
+                let branch_target_offset = branch_target - relocated_insns_addr_range.start;
+                return Err(HookError::RelocatedInsnJumpsIntoAnotherRelocatedInsn {
+                    insn_offset: decoded_insn_offset,
+                    target_offset: branch_target_offset as usize,
+                });
+            }
             let relocated_insn_bytes: RelocatedInsnBytes = match branch_kind {
                 BranchKind::Jmp => as_raw_bytes(&RelocatedJmpImm::new(branch_target))
                     .try_into()
@@ -404,8 +420,14 @@ pub enum HookError {
     #[error("can't relocate rip relative instruction at offset {offset}")]
     UnsupportedRipRelativeInsn { offset: usize },
 
-    #[error("fn size {fn_size} is to small for jumper of size {jumper_size}")]
+    #[error("function size {fn_size} is to small for jumper of size {jumper_size}")]
     FnTooSmallTooHook { fn_size: usize, jumper_size: usize },
+
+    #[error("relocated branch instruction at offset {insn_offset} jumps into another relocated instruction at offset {target_offset}")]
+    RelocatedInsnJumpsIntoAnotherRelocatedInsn {
+        insn_offset: usize,
+        target_offset: usize,
+    },
 }
 
 /// the different kinds of jumper available
