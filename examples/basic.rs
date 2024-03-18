@@ -73,7 +73,12 @@ fn main() {
 
 #[inline(never)]
 extern "C" fn hooked_fn(input: u32) -> u32 {
-    println!("hooked fn was called, input: {}", input);
+    // force some conditional branches at the start of the function so that relocation is performed
+    if input == 0 {
+        println!("hooked fn called with zero input");
+    } else {
+        println!("hooked fn called with non-zero input");
+    }
     44
 }
 
