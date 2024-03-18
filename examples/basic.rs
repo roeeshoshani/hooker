@@ -2,8 +2,8 @@ use hooker::gen_hook_info;
 use region::{Allocation, Protection, Region};
 
 /// find the memory mapping of the `.text` section, where our code is
-fn mem_region_of_hooked_fn() -> Region {
-    region::query(hooked_fn as *const u8)
+fn mem_region_of_hooked_fn(hooked_fn_addr: usize) -> Region {
+    region::query(hooked_fn_addr as *const u8)
         .expect("failed to find memory region containing hooked fn")
 }
 
@@ -25,8 +25,12 @@ fn alloc_rwx(size: usize) -> Allocation {
 }
 
 fn main() {
+    run(hooked_fn_jmp);
+    run(hooked_fn_rip_relative_load);
+}
+fn run(hooked_fn: extern "C" fn(u32) -> u32) {
     // make the hooked fn writable
-    let hooked_fn_region = mem_region_of_hooked_fn();
+    let hooked_fn_region = mem_region_of_hooked_fn(hooked_fn as usize);
     make_rwx(&hooked_fn_region);
 
     // generate a slice of the possible content of the hooked fn, that is the content from the start of the hooked fn to the
@@ -74,8 +78,8 @@ fn main() {
 }
 
 #[inline(never)]
-extern "C" fn hooked_fn(mut input: u32) -> u32 {
-    // force some conditional branches at the start of the function so that relocation is performed
+extern "C" fn hooked_fn_jmp(mut input: u32) -> u32 {
+    // force some conditional branches
     if input == 0 {
         77
     } else {
@@ -84,6 +88,14 @@ extern "C" fn hooked_fn(mut input: u32) -> u32 {
         }
         input * 1000
     }
+}
+
+#[inline(never)]
+extern "C" fn hooked_fn_rip_relative_load(input: u32) -> u32 {
+    static mut GLOBAL: u32 = 5;
+    // force a rip relative memory load
+    let value_of_global = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(GLOBAL)) };
+    input + value_of_global
 }
 
 #[inline(never)]

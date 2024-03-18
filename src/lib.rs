@@ -5,15 +5,24 @@ use core::{mem::MaybeUninit, ops::Range};
 use arrayvec::ArrayVec;
 use thiserror_no_std::Error;
 use zydis_sys::{
-    ZyanStatus, ZydisDecodedInstruction, ZydisDecodedOperand, ZydisDecoder, ZydisDecoderContext,
-    ZydisDecoderDecodeInstruction, ZydisDecoderDecodeOperands, ZydisDecoderInit,
+    ZyanStatus, ZydisDecodedInstruction, ZydisDecodedOperand, ZydisDecoder, ZydisDecoderDecodeFull,
+    ZydisDecoderInit, ZydisEncoderDecodedInstructionToEncoderRequest,
     ZydisEncoderEncodeInstruction, ZydisEncoderRequest, ZydisMachineMode, ZydisMnemonic,
-    ZydisOperandType, ZydisRegister, ZydisStackWidth, ZYDIS_MAX_INSTRUCTION_LENGTH,
-    ZYDIS_MAX_OPERAND_COUNT_VISIBLE,
+    ZydisOperandType, ZydisRegister, ZydisRegisterGetLargestEnclosing, ZydisStackWidth,
+    ZYDIS_MAX_INSTRUCTION_LENGTH, ZYDIS_MAX_OPERAND_COUNT,
 };
 
-const MAX_INSN_VISIBLE_OPERANDS: usize = ZYDIS_MAX_OPERAND_COUNT_VISIBLE as usize;
+const MAX_INSN_OPERANDS: usize = ZYDIS_MAX_OPERAND_COUNT as usize;
 const ZYAN_IS_ERROR_BIT_MASK: u32 = 0x80000000;
+const POSSIBLE_TMP_REGS: &[ZydisRegister] = &[
+    ZydisRegister::ZYDIS_REGISTER_RAX,
+    ZydisRegister::ZYDIS_REGISTER_RBX,
+    ZydisRegister::ZYDIS_REGISTER_RCX,
+    ZydisRegister::ZYDIS_REGISTER_RDX,
+    ZydisRegister::ZYDIS_REGISTER_RSI,
+    ZydisRegister::ZYDIS_REGISTER_RDI,
+    ZydisRegister::ZYDIS_REGISTER_RBP,
+];
 
 const PUSH_RIP_INSN_LEN: usize = 5;
 const PUSH_RIP_INSN: [u8; PUSH_RIP_INSN_LEN] = [0xE8, 0x00, 0x00, 0x00, 0x00];
@@ -28,16 +37,41 @@ macro_rules! const_max {
             $b
         }
     };
+    ($a: expr, $b: expr, $($other: expr),+) => {
+        if $a > $b {
+            const_max!($a, $($other),+)
+        } else {
+            const_max!($b, $($other),+)
+        }
+    }
+}
+macro_rules! max_size {
+    ($($ty: ty),+) => {
+        const_max!(
+            $(
+                core::mem::size_of::<$ty>()
+            ),+
+        )
+    };
 }
 
+const MAX_INSN_LEN: usize = ZYDIS_MAX_INSTRUCTION_LENGTH as usize;
+
+/// the amount of bytes added to a relocated [rip+X] addressing instruction.
+const RELOCATED_MEM_RIP_INSN_ADDED_LEN: usize =
+    core::mem::size_of::<RelocatedMemRipPrefix>() + core::mem::size_of::<RelocatedMemRipPostfix>();
+
+/// the maximum length of a relocated [rip+X] addressing instruction.
+const MAX_RELOCATED_MEM_RIP_INSN_LEN: usize = MAX_INSN_LEN + RELOCATED_MEM_RIP_INSN_ADDED_LEN;
+
 /// the maximum length of a relocated instruction
-pub const MAX_RELOCATED_INSN_LEN: usize = core::mem::size_of::<RelocatedInsnUnion>();
+pub const MAX_RELOCATED_INSN_LEN: usize = const_max!(
+    max_size!(RelocatedJmpImm, RelocatedCallImm, RelocatedCondJmpImm),
+    MAX_RELOCATED_MEM_RIP_INSN_LEN
+);
 
 /// the maximum length of an instruction that is either relocated or the original instruction
-pub const MAX_MAYBE_RELOCATED_INSN_LEN: usize = const_max!(
-    MAX_RELOCATED_INSN_LEN,
-    ZYDIS_MAX_INSTRUCTION_LENGTH as usize
-);
+pub const MAX_MAYBE_RELOCATED_INSN_LEN: usize = const_max!(MAX_RELOCATED_INSN_LEN, MAX_INSN_LEN);
 
 /// the length of a short relative jumper.
 pub const SHORT_REL_JUMPER_LEN: usize = core::mem::size_of::<ShortRelJumper>();
@@ -81,6 +115,9 @@ pub type RelocatedInsnsBytes = ArrayVec<u8, MAX_RELOCATED_INSNS_LEN>;
 
 /// a type alias for the bytes of a trampoline.
 pub type TrampolineBytes = ArrayVec<u8, MAX_TRAMPOLINE_LEN>;
+
+/// a type alias for the bytes of an instruction.
+type InsnBytes = ArrayVec<u8, MAX_INSN_LEN>;
 
 /// generates information needed to hook the given fn.
 pub fn gen_hook_info(
@@ -221,14 +258,106 @@ fn relocate_insn(
             relocated_insns_addr_range,
         );
     }
-
-    if is_insn_rip_relative(decoded_insn) {
-        Err(HookError::UnsupportedRipRelativeInsn {
+    // for detecting other branch types which we do not support, we can just check for rip relative immediate operands.
+    if decoded_insn.does_have_rel_imm_operand() {
+        return Err(HookError::UnsupportedRipRelativeInsn {
             offset: decoded_insn_offset,
-        })
-    } else {
-        Ok(None)
+        });
     }
+
+    let mut rip_relative_operands = decoded_insn
+        .visible_operands()
+        .iter()
+        .enumerate()
+        .filter(|(_, operand)| is_operand_rip_relative_mem_access(&operand));
+    let Some((rip_relative_operand_index, rip_relative_operand)) = rip_relative_operands.next()
+    else {
+        // no rip relative operands, so no need to relocate the instruction
+        return Ok(None);
+    };
+    // an instruction can't have multiple rip relative operands
+    assert!(rip_relative_operands.next().is_none());
+
+    Ok(Some(relocate_mem_rip_insn(
+        decoded_insn,
+        decoded_insn_offset,
+        rip_relative_operand,
+        rip_relative_operand_index,
+    )?))
+}
+
+fn relocate_mem_rip_insn(
+    decoded_insn: &DecodedInsnInfo,
+    decoded_insn_offset: usize,
+    rip_relative_operand: &zydis_sys::ZydisDecodedOperand_,
+    rip_relative_operand_index: usize,
+) -> Result<RelocatedInsnBytes, HookError> {
+    // if it uses the stack, we can't relocate it, since our relocation involves pushing some registers to the stack,
+    // which will corrupt the instruction's behaviour.
+    if decoded_insn.does_use_register(ZydisRegister::ZYDIS_REGISTER_RSP) {
+        return Err(HookError::UnsupportedRipRelativeInsn {
+            offset: decoded_insn_offset,
+        });
+    }
+
+    // calculate the target address of the `rip+displacement`.
+    let mem_operand = unsafe { &rip_relative_operand.__bindgen_anon_1.mem };
+    let mem_operand_disp = if mem_operand.disp.has_displacement != 0 {
+        mem_operand.disp.value
+    } else {
+        0
+    };
+    let mem_rip_target_addr = decoded_insn
+        .end_addr()
+        .wrapping_add_signed(mem_operand_disp);
+
+    // find a usable temp register
+    let tmp_reg = POSSIBLE_TMP_REGS
+        .iter()
+        .copied()
+        .find(|tmp_reg| !decoded_insn.does_use_register(*tmp_reg))
+        .expect("instruction uses all possible temporary registers");
+
+    // re-encode the instruction but replace the `rip+displacement` part with `tmp_reg`.
+    let mut encoder_req = decoded_insn.to_encoder_request(decoded_insn_offset)?;
+    encoder_req.operands[rip_relative_operand_index]
+        .mem
+        .displacement = 0;
+    encoder_req.operands[rip_relative_operand_index].mem.base = tmp_reg;
+    let re_encoded = encode_insn(&encoder_req).map_err(|_| HookError::FailedToReEncodeInsn {
+        offset: decoded_insn_offset,
+    })?;
+
+    // build the prefix and postfix
+    let prefix = RelocatedMemRipPrefix::new(tmp_reg, mem_rip_target_addr);
+    let postfix = RelocatedMemRipPostfix::new(tmp_reg);
+
+    // combine all parts into a single byte array
+    let mut relocated_insn_bytes = RelocatedInsnBytes::new();
+    relocated_insn_bytes
+        .try_extend_from_slice(as_raw_bytes(&prefix))
+        .unwrap();
+    relocated_insn_bytes
+        .try_extend_from_slice(&re_encoded)
+        .unwrap();
+    relocated_insn_bytes
+        .try_extend_from_slice(as_raw_bytes(&postfix))
+        .unwrap();
+    Ok(relocated_insn_bytes)
+}
+
+fn encode_insn(encoder_req: &ZydisEncoderRequest) -> Result<InsnBytes, ()> {
+    let mut insn_bytes = InsnBytes::new();
+    let mut insn_len = insn_bytes.capacity() as u64;
+    let status = unsafe {
+        ZydisEncoderEncodeInstruction(encoder_req, insn_bytes.as_mut_ptr().cast(), &mut insn_len)
+    };
+    zyan_check(status)?;
+    assert!(insn_len <= insn_bytes.capacity() as u64);
+    unsafe {
+        insn_bytes.set_len(insn_len as usize);
+    }
+    Ok(insn_bytes)
 }
 
 fn relocate_branch_insn(
@@ -237,8 +366,8 @@ fn relocate_branch_insn(
     branch_kind: BranchKind,
     relocated_insns_addr_range: &Range<u64>,
 ) -> Result<Option<RelocatedInsnBytes>, HookError> {
-    assert_eq!(decoded_insn.operands.len(), 1);
-    let operand = &decoded_insn.operands[0];
+    assert_eq!(decoded_insn.visible_operands().len(), 1);
+    let operand = &decoded_insn.visible_operands()[0];
     match operand.type_ {
         ZydisOperandType::ZYDIS_OPERAND_TYPE_REGISTER
         | ZydisOperandType::ZYDIS_OPERAND_TYPE_POINTER => Ok(None),
@@ -337,39 +466,23 @@ impl Decoder {
     }
 
     fn decode(&self, buf: &[u8], insn_runtime_addr: u64) -> Result<DecodedInsnInfo, ()> {
-        let mut decoder_ctx_uninit: MaybeUninit<ZydisDecoderContext> = MaybeUninit::uninit();
         let mut insn_uninit: MaybeUninit<ZydisDecodedInstruction> = MaybeUninit::uninit();
+        let mut operands: ArrayVec<ZydisDecodedOperand, MAX_INSN_OPERANDS> = ArrayVec::new();
 
         let status = unsafe {
-            ZydisDecoderDecodeInstruction(
+            ZydisDecoderDecodeFull(
                 &self.decoder,
-                decoder_ctx_uninit.as_mut_ptr(),
                 buf.as_ptr().cast(),
                 buf.len() as u64,
                 insn_uninit.as_mut_ptr(),
-            )
-        };
-        zyan_check(status)?;
-
-        let decoder_ctx = unsafe { decoder_ctx_uninit.assume_init() };
-        let insn = unsafe { insn_uninit.assume_init() };
-
-        assert!(insn.operand_count_visible <= MAX_INSN_VISIBLE_OPERANDS as u8);
-
-        let mut operands: ArrayVec<ZydisDecodedOperand, MAX_INSN_VISIBLE_OPERANDS> =
-            ArrayVec::new();
-        let status = unsafe {
-            ZydisDecoderDecodeOperands(
-                &self.decoder,
-                &decoder_ctx,
-                &insn,
                 operands.as_mut_ptr(),
-                insn.operand_count_visible,
             )
         };
         zyan_check(status)?;
 
-        unsafe { operands.set_len(insn.operand_count_visible as usize) }
+        let insn = unsafe { insn_uninit.assume_init() };
+        assert!(insn.operand_count as usize <= operands.capacity());
+        unsafe { operands.set_len(insn.operand_count as usize) }
 
         Ok(DecodedInsnInfo {
             insn,
@@ -379,36 +492,102 @@ impl Decoder {
     }
 }
 
-fn is_insn_rip_relative(decoded_insn: &DecodedInsnInfo) -> bool {
-    for operand in &decoded_insn.operands {
-        match operand.type_ {
-            ZydisOperandType::ZYDIS_OPERAND_TYPE_IMMEDIATE => {
-                if unsafe { operand.__bindgen_anon_1.imm }.is_relative != 0 {
-                    return true;
-                }
+fn is_operand_rip_relative_mem_access(operand: &ZydisDecodedOperand) -> bool {
+    match operand.type_ {
+        ZydisOperandType::ZYDIS_OPERAND_TYPE_MEMORY => {
+            if unsafe { operand.__bindgen_anon_1.mem }.base == ZydisRegister::ZYDIS_REGISTER_RIP {
+                true
+            } else {
+                false
             }
-            ZydisOperandType::ZYDIS_OPERAND_TYPE_MEMORY => {
-                if unsafe { operand.__bindgen_anon_1.mem }.base == ZydisRegister::ZYDIS_REGISTER_RIP
-                {
-                    return true;
-                }
-            }
-            _ => {}
         }
+        _ => false,
     }
-    false
+}
+
+fn is_operand_rip_relative_imm(operand: &ZydisDecodedOperand) -> bool {
+    match operand.type_ {
+        ZydisOperandType::ZYDIS_OPERAND_TYPE_IMMEDIATE => {
+            unsafe { operand.__bindgen_anon_1.imm }.is_relative != 0
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
 struct DecodedInsnInfo {
     addr: u64,
     insn: ZydisDecodedInstruction,
-    operands: ArrayVec<ZydisDecodedOperand, MAX_INSN_VISIBLE_OPERANDS>,
+    operands: ArrayVec<ZydisDecodedOperand, MAX_INSN_OPERANDS>,
 }
 impl DecodedInsnInfo {
     fn end_addr(&self) -> u64 {
         self.addr + self.insn.length as u64
     }
+    fn visible_operands(&self) -> &[ZydisDecodedOperand] {
+        &self.operands[..self.insn.operand_count_visible as usize]
+    }
+    fn does_use_register(&self, reg: ZydisRegister) -> bool {
+        self.operands
+            .iter()
+            .any(|operand| does_operand_use_register(operand, reg))
+    }
+    fn does_have_rel_imm_operand(&self) -> bool {
+        self.operands
+            .iter()
+            .any(|operand| is_operand_rip_relative_imm(operand))
+    }
+    fn to_encoder_request(&self, insn_offset: usize) -> Result<ZydisEncoderRequest, HookError> {
+        let mut encoder_req_uninit: MaybeUninit<ZydisEncoderRequest> = MaybeUninit::uninit();
+        let status = unsafe {
+            ZydisEncoderDecodedInstructionToEncoderRequest(
+                &self.insn,
+                self.operands.as_ptr(),
+                self.insn.operand_count_visible,
+                encoder_req_uninit.as_mut_ptr(),
+            )
+        };
+        zyan_check(status).map_err(|_| HookError::FailedToReEncodeInsn {
+            offset: insn_offset,
+        })?;
+        Ok(unsafe { encoder_req_uninit.assume_init() })
+    }
+}
+
+fn does_operand_use_register(operand: &ZydisDecodedOperand, reg: ZydisRegister) -> bool {
+    match operand.type_ {
+        ZydisOperandType::ZYDIS_OPERAND_TYPE_REGISTER => {
+            do_regs_collide(unsafe { operand.__bindgen_anon_1.reg }.value, reg)
+        }
+        ZydisOperandType::ZYDIS_OPERAND_TYPE_IMMEDIATE
+        | ZydisOperandType::ZYDIS_OPERAND_TYPE_POINTER => false,
+        ZydisOperandType::ZYDIS_OPERAND_TYPE_MEMORY => {
+            let mem_operand = unsafe { &operand.__bindgen_anon_1.mem };
+            do_regs_collide(mem_operand.segment, reg)
+                || do_regs_collide(mem_operand.base, reg)
+                || do_regs_collide(mem_operand.index, reg)
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn do_regs_collide(reg_a: ZydisRegister, reg_b: ZydisRegister) -> bool {
+    if reg_a == reg_b {
+        return true;
+    }
+    let largest_enclosing_reg_a = unsafe {
+        ZydisRegisterGetLargestEnclosing(ZydisMachineMode::ZYDIS_MACHINE_MODE_LONG_64, reg_a)
+    };
+    if largest_enclosing_reg_a == ZydisRegister::ZYDIS_REGISTER_NONE {
+        return false;
+    }
+    let largest_enclosing_reg_b = unsafe {
+        ZydisRegisterGetLargestEnclosing(ZydisMachineMode::ZYDIS_MACHINE_MODE_LONG_64, reg_b)
+    };
+    if largest_enclosing_reg_b == ZydisRegister::ZYDIS_REGISTER_NONE {
+        return false;
+    }
+    largest_enclosing_reg_a == largest_enclosing_reg_b
 }
 
 /// an error which occured while trying to relocate instructions.
@@ -428,6 +607,9 @@ pub enum HookError {
         insn_offset: usize,
         target_offset: usize,
     },
+
+    #[error("failed to re-encode instruction at offset {offset} while trying to relocate it")]
+    FailedToReEncodeInsn { offset: usize },
 }
 
 /// the different kinds of jumper available
@@ -482,7 +664,37 @@ fn as_raw_bytes<T>(value: &T) -> &[u8] {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct RelocatedMemRipPrefix {
+    push_tmp_reg: PushGpr,
+    mov_tmp_reg: MovGpr64BitImm,
+}
+impl RelocatedMemRipPrefix {
+    fn new(tmp_reg: ZydisRegister, target_addr: u64) -> Self {
+        Self {
+            push_tmp_reg: PushGpr::new(tmp_reg),
+            mov_tmp_reg: MovGpr64BitImm::new(tmp_reg, target_addr),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct RelocatedMemRipPostfix {
+    pop_tmp_reg: PopGpr,
+}
+impl RelocatedMemRipPostfix {
+    fn new(tmp_reg: ZydisRegister) -> Self {
+        Self {
+            pop_tmp_reg: PopGpr::new(tmp_reg),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct RelocatedJmpImm {
     jumper: LongJumper,
@@ -496,7 +708,7 @@ impl RelocatedJmpImm {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct JmpMemRipPlus {
     opcode: [u8; 2],
@@ -512,7 +724,7 @@ impl JmpMemRipPlus {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct RelJmp8Bit {
     code: [u8; 2],
@@ -537,7 +749,84 @@ impl RelJmp8Bit {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct PushGpr {
+    code: u8,
+}
+impl PushGpr {
+    fn new(gpr: ZydisRegister) -> Self {
+        let mut encoder_request: ZydisEncoderRequest = unsafe { core::mem::zeroed() };
+        encoder_request.machine_mode = ZydisMachineMode::ZYDIS_MACHINE_MODE_LONG_64;
+        encoder_request.mnemonic = ZydisMnemonic::ZYDIS_MNEMONIC_PUSH;
+        encoder_request.operand_count = 1;
+        encoder_request.operands[0].type_ = ZydisOperandType::ZYDIS_OPERAND_TYPE_REGISTER;
+        encoder_request.operands[0].reg.value = gpr;
+        let mut code = [0u8; 1];
+        let mut code_len = code.len() as u64;
+        let status = unsafe {
+            ZydisEncoderEncodeInstruction(&encoder_request, code.as_mut_ptr().cast(), &mut code_len)
+        };
+        zyan_check(status).expect("failed to encode 1 byte push gpr");
+        assert_eq!(code_len, 1);
+        Self { code: code[0] }
+    }
+}
+
+#[allow(dead_code)]
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct PopGpr {
+    code: u8,
+}
+impl PopGpr {
+    fn new(gpr: ZydisRegister) -> Self {
+        let mut encoder_request: ZydisEncoderRequest = unsafe { core::mem::zeroed() };
+        encoder_request.machine_mode = ZydisMachineMode::ZYDIS_MACHINE_MODE_LONG_64;
+        encoder_request.mnemonic = ZydisMnemonic::ZYDIS_MNEMONIC_POP;
+        encoder_request.operand_count = 1;
+        encoder_request.operands[0].type_ = ZydisOperandType::ZYDIS_OPERAND_TYPE_REGISTER;
+        encoder_request.operands[0].reg.value = gpr;
+        let mut code = [0u8; 1];
+        let mut code_len = code.len() as u64;
+        let status = unsafe {
+            ZydisEncoderEncodeInstruction(&encoder_request, code.as_mut_ptr().cast(), &mut code_len)
+        };
+        zyan_check(status).expect("failed to encode 1 byte pop gpr");
+        assert_eq!(code_len, 1);
+        Self { code: code[0] }
+    }
+}
+
+#[allow(dead_code)]
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct MovGpr64BitImm {
+    code: [u8; 10],
+}
+impl MovGpr64BitImm {
+    fn new(gpr: ZydisRegister, value: u64) -> Self {
+        let mut encoder_request: ZydisEncoderRequest = unsafe { core::mem::zeroed() };
+        encoder_request.machine_mode = ZydisMachineMode::ZYDIS_MACHINE_MODE_LONG_64;
+        encoder_request.mnemonic = ZydisMnemonic::ZYDIS_MNEMONIC_MOV;
+        encoder_request.operand_count = 2;
+        encoder_request.operands[0].type_ = ZydisOperandType::ZYDIS_OPERAND_TYPE_REGISTER;
+        encoder_request.operands[0].reg.value = gpr;
+        encoder_request.operands[1].type_ = ZydisOperandType::ZYDIS_OPERAND_TYPE_IMMEDIATE;
+        encoder_request.operands[1].imm.u = value;
+        let mut code = [0u8; 10];
+        let mut code_len = code.len() as u64;
+        let status = unsafe {
+            ZydisEncoderEncodeInstruction(&encoder_request, code.as_mut_ptr().cast(), &mut code_len)
+        };
+        zyan_check(status).expect("failed to encode 10 byte mov 64 bit immediate into gpr");
+        assert_eq!(code_len, 10);
+        Self { code }
+    }
+}
+
+#[allow(dead_code)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct RelocatedCondJmpImm {
     original_jmp: RelJmp8Bit,
@@ -563,7 +852,7 @@ impl RelocatedCondJmpImm {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct RelocatedCallImm {
     push_rip_insn: [u8; PUSH_RIP_INSN_LEN],
@@ -585,7 +874,7 @@ impl RelocatedCallImm {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct Add8BitImmToMemRsp {
     opcode: [u8; 4],
@@ -601,7 +890,7 @@ impl Add8BitImmToMemRsp {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct ShortRelJumper {
     jump_opcode: u8,
@@ -617,7 +906,7 @@ impl ShortRelJumper {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct ShortJumper {
     push: Push32BitImm,
@@ -633,7 +922,7 @@ impl ShortJumper {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct Push32BitImm {
     push_opcode: u8,
@@ -649,7 +938,7 @@ impl Push32BitImm {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct LongJumper {
     jmp_rip: JmpMemRipPlus,
@@ -665,21 +954,12 @@ impl LongJumper {
 }
 
 #[allow(dead_code)]
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 union JumperUnion {
     short_rel: ShortRelJumper,
     short: ShortJumper,
     long: LongJumper,
-}
-
-#[allow(dead_code)]
-#[repr(packed)]
-#[derive(Clone, Copy)]
-union RelocatedInsnUnion {
-    jmp_imm: RelocatedJmpImm,
-    cond_jmp_imm: RelocatedCondJmpImm,
-    call_imm: RelocatedCallImm,
 }
 
 fn zyan_is_err(status: ZyanStatus) -> bool {
