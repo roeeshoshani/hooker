@@ -1,6 +1,6 @@
 [package]
 name = "hooker"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Roee Shoshani"]
 description = "a helper for hooking functions in x64"
