@@ -47,6 +47,7 @@ fn main() {
     // allocate and build trampoline
     let mut trampoline_alloc = alloc_rwx(hook_info.trampoline_size());
     let trampoline = hook_info.build_trampoline(trampoline_alloc.as_mut_ptr::<u8>() as u64);
+    println!("trampoline code: {:02x?}", trampoline.as_slice());
     unsafe {
         trampoline_alloc
             .as_mut_ptr::<u8>()
@@ -55,6 +56,7 @@ fn main() {
 
     // write the jumper to the start of the hooked fn
     let jumper = hook_info.jumper();
+    println!("jumper code: {:02x?}", jumper.as_slice());
     let hooked_fn_content_ptr = hooked_fn as *mut u8;
 
     // call the hooked fn
@@ -72,14 +74,16 @@ fn main() {
 }
 
 #[inline(never)]
-extern "C" fn hooked_fn(input: u32) -> u32 {
+extern "C" fn hooked_fn(mut input: u32) -> u32 {
     // force some conditional branches at the start of the function so that relocation is performed
     if input == 0 {
-        println!("hooked fn called with zero input");
+        77
     } else {
-        println!("hooked fn called with non-zero input");
+        for i in 2..10 {
+            input ^= input / i;
+        }
+        input * 1000
     }
-    44
 }
 
 #[inline(never)]
