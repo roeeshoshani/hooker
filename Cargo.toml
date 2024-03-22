@@ -1,6 +1,6 @@
 [package]
 name = "hooker"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 authors = ["Roee Shoshani"]
 description = "a helper for hooking functions in x64"
@@ -12,7 +12,7 @@ categories = ["embedded", "no-std"]
 [dependencies]
 arrayvec = { version = "0.7.4", default-features = false }
 thiserror-no-std = "2.0.2"
-zydis-sys = "0.1.1"
+zydis-sys = "0.1.2"
 
 [features]
 std = [ "thiserror-no-std/std", "arrayvec/std" ]

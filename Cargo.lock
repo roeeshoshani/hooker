@@ -107,7 +107,7 @@ checksum = "d2fabcfbdc87f4758337ca535fb41a6d701b65693ce38287d856d1674551ec9b"
 
 [[package]]
 name = "hooker"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arrayvec",
  "region",
@@ -397,9 +397,9 @@ checksum = "32b752e52a2da0ddfbdbcc6fceadfeede4c939ed16d13e648833a61dfb611ed8"
 
 [[package]]
 name = "zydis-sys"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db5e2b765fc9dbe8bec101f780ce7edacb1aaa585ffd246cbe542f95587d23b2"
+checksum = "ff78d06d4a8a06eb1adbf5ff9383ff36616e29c74822257ef0cc70809a9e1149"
 dependencies = [
  "bindgen",
  "cmake",
