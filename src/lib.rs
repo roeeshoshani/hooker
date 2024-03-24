@@ -141,8 +141,8 @@ pub struct HookInfo {
 impl HookInfo {
     /// returns the jumper which should be placed at the start of the hooked fn in order to hook it.
     /// this takes ownership of the hook info. make sure that you first build your trampoline.
-    pub fn jumper(self) -> JumperBytes {
-        self.jumper
+    pub fn jumper(&self) -> &JumperBytes {
+        &self.jumper
     }
     /// returns the size of the trampoline which will be built for this hooked fn.
     pub fn trampoline_size(&self) -> usize {
