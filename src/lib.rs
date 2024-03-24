@@ -231,6 +231,7 @@ pub fn relocate_fn_start(
     Ok(RelocatedFnStart {
         relocated_insns_bytes,
         trampoline_jumper_target_offset: cur_index,
+        hooked_fn_runtime_addr,
     })
 }
 
