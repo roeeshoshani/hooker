@@ -130,7 +130,6 @@ pub fn gen_hook_info(
     Ok(HookInfo {
         jumper,
         relocated_fn,
-        hooked_fn_runtime_addr,
     })
 }
 
@@ -138,7 +137,6 @@ pub fn gen_hook_info(
 pub struct HookInfo {
     jumper: JumperBytes,
     relocated_fn: RelocatedFnStart,
-    hooked_fn_runtime_addr: u64,
 }
 impl HookInfo {
     /// returns the jumper which should be placed at the start of the hooked fn in order to hook it.
@@ -148,23 +146,14 @@ impl HookInfo {
     }
     /// returns the size of the trampoline which will be built for this hooked fn.
     pub fn trampoline_size(&self) -> usize {
-        self.relocated_fn.relocated_insns_bytes.len() + LONG_JUMPER_LEN
+        self.relocated_fn.trampoline_size()
     }
     /// builds a trampoline which will be placed at the given runtime address.
     /// the size of the trampoline can be determined by calling [`trampoline_size`].
     ///
     /// [`trampoline_size`]: HookInfo::trampoline_size
     pub fn build_trampoline(&self, trampoline_runtime_addr: u64) -> TrampolineBytes {
-        let mut tramp_bytes = TrampolineBytes::new();
-        tramp_bytes
-            .try_extend_from_slice(&self.relocated_fn.relocated_insns_bytes)
-            .unwrap();
-        let jumper = JumperKind::Long.build(
-            trampoline_runtime_addr + self.relocated_fn.relocated_insns_bytes.len() as u64,
-            self.hooked_fn_runtime_addr + self.relocated_fn.trampoline_jumper_target_offset as u64,
-        );
-        tramp_bytes.try_extend_from_slice(&jumper).unwrap();
-        tramp_bytes
+        self.relocated_fn.build_trampoline(trampoline_runtime_addr)
     }
 }
 
@@ -446,6 +435,31 @@ pub struct RelocatedFnStart {
     pub relocated_insns_bytes: RelocatedInsnsBytes,
     /// the offset in the hooked function where the trampoline jumper should jump to in order to continue execution of this function.
     pub trampoline_jumper_target_offset: usize,
+    /// the runtime address of the hooked function.
+    pub hooked_fn_runtime_addr: u64,
+}
+impl RelocatedFnStart {
+    /// returns the size of the trampoline which will be built for this hooked fn.
+    pub fn trampoline_size(&self) -> usize {
+        self.relocated_insns_bytes.len() + LONG_JUMPER_LEN
+    }
+
+    /// builds a trampoline which will be placed at the given runtime address.
+    /// the size of the trampoline can be determined by calling [`trampoline_size`].
+    ///
+    /// [`trampoline_size`]: HookInfo::trampoline_size
+    pub fn build_trampoline(&self, trampoline_runtime_addr: u64) -> TrampolineBytes {
+        let mut tramp_bytes = TrampolineBytes::new();
+        tramp_bytes
+            .try_extend_from_slice(&self.relocated_insns_bytes)
+            .unwrap();
+        let jumper = JumperKind::Long.build(
+            trampoline_runtime_addr + self.relocated_insns_bytes.len() as u64,
+            self.hooked_fn_runtime_addr + self.trampoline_jumper_target_offset as u64,
+        );
+        tramp_bytes.try_extend_from_slice(&jumper).unwrap();
+        tramp_bytes
+    }
 }
 
 struct Decoder {
