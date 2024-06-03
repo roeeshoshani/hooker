@@ -228,9 +228,31 @@ pub fn relocate_fn_start(
         }
         cur_index += insn.insn.length as usize;
     }
+    let trampoline_jumper_target_offset = cur_index;
+    while cur_index < hooked_fn_content.len() {
+        let Ok(decoded_insn) = decoder.decode(
+            &hooked_fn_content[cur_index..],
+            hooked_fn_runtime_addr + cur_index as u64,
+        ) else {
+            break;
+        };
+        if mnemonic_is_branch(decoded_insn.insn.mnemonic).is_some() {
+            check_jmp_insn_doesnt_jump_into_relocated_insns(
+                &decoded_insn,
+                cur_index,
+                &relocated_insns_addr_range,
+            )?;
+        }
+        // if we encounter a `ret`, this is the end of this fn, so make sure that this is the last instruction that
+        // we need to relocate.
+        if decoded_insn.insn.mnemonic == ZydisMnemonic::ZYDIS_MNEMONIC_RET {
+            break;
+        }
+        cur_index += decoded_insn.insn.length as usize;
+    }
     Ok(RelocatedFnStart {
         relocated_insns_bytes,
-        trampoline_jumper_target_offset: cur_index,
+        trampoline_jumper_target_offset,
         hooked_fn_runtime_addr,
     })
 }
@@ -358,6 +380,11 @@ fn relocate_branch_insn(
 ) -> Result<Option<RelocatedInsnBytes>, HookError> {
     assert_eq!(decoded_insn.visible_operands().len(), 1);
     let operand = &decoded_insn.visible_operands()[0];
+    check_jmp_insn_doesnt_jump_into_relocated_insns(
+        decoded_insn,
+        decoded_insn_offset,
+        relocated_insns_addr_range,
+    )?;
     match operand.type_ {
         ZydisOperandType::ZYDIS_OPERAND_TYPE_REGISTER
         | ZydisOperandType::ZYDIS_OPERAND_TYPE_POINTER => Ok(None),
@@ -369,13 +396,6 @@ fn relocate_branch_insn(
             }
             let insn_end_addr = decoded_insn.end_addr();
             let branch_target = insn_end_addr.wrapping_add(unsafe { imm_operand.value.u });
-            if relocated_insns_addr_range.contains(&branch_target) {
-                let branch_target_offset = branch_target - relocated_insns_addr_range.start;
-                return Err(HookError::RelocatedInsnJumpsIntoAnotherRelocatedInsn {
-                    insn_offset: decoded_insn_offset,
-                    target_offset: branch_target_offset as usize,
-                });
-            }
             let relocated_insn_bytes: RelocatedInsnBytes = match branch_kind {
                 BranchKind::Jmp => as_raw_bytes(&RelocatedJmpImm::new(branch_target))
                     .try_into()
@@ -395,6 +415,38 @@ fn relocate_branch_insn(
         ZydisOperandType::ZYDIS_OPERAND_TYPE_MEMORY => Err(HookError::UnsupportedRipRelativeInsn {
             offset: decoded_insn_offset,
         }),
+        _ => unreachable!(),
+    }
+}
+
+fn check_jmp_insn_doesnt_jump_into_relocated_insns(
+    decoded_insn: &DecodedInsnInfo,
+    decoded_insn_offset: usize,
+    relocated_insns_addr_range: &Range<u64>,
+) -> Result<(), HookError> {
+    assert_eq!(decoded_insn.visible_operands().len(), 1);
+    let operand = &decoded_insn.visible_operands()[0];
+    match operand.type_ {
+        ZydisOperandType::ZYDIS_OPERAND_TYPE_REGISTER
+        | ZydisOperandType::ZYDIS_OPERAND_TYPE_POINTER => Ok(()),
+        ZydisOperandType::ZYDIS_OPERAND_TYPE_IMMEDIATE => {
+            let imm_operand = unsafe { &operand.__bindgen_anon_1.imm };
+            let branch_target = if imm_operand.is_relative == 0 {
+                unsafe { imm_operand.value.u }
+            } else {
+                let insn_end_addr = decoded_insn.end_addr();
+                insn_end_addr.wrapping_add(unsafe { imm_operand.value.u })
+            };
+            if relocated_insns_addr_range.contains(&branch_target) {
+                let branch_target_offset = branch_target - relocated_insns_addr_range.start;
+                return Err(HookError::InsnJumpsIntoAnotherRelocatedInsn {
+                    insn_offset: decoded_insn_offset,
+                    target_offset: branch_target_offset as usize,
+                });
+            }
+            Ok(())
+        }
+        ZydisOperandType::ZYDIS_OPERAND_TYPE_MEMORY => Ok(()),
         _ => unreachable!(),
     }
 }
@@ -619,8 +671,8 @@ pub enum HookError {
     #[error("function size {fn_size} is to small for jumper of size {jumper_size}")]
     FnTooSmallTooHook { fn_size: usize, jumper_size: usize },
 
-    #[error("relocated branch instruction at offset {insn_offset} jumps into another relocated instruction at offset {target_offset}")]
-    RelocatedInsnJumpsIntoAnotherRelocatedInsn {
+    #[error("instruction at offset {insn_offset} jumps into a relocated instruction at offset {target_offset}")]
+    InsnJumpsIntoAnotherRelocatedInsn {
         insn_offset: usize,
         target_offset: usize,
     },
